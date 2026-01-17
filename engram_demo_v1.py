@@ -54,8 +54,61 @@ class BackBoneConfig:
     vocab_size: int = 129280
     num_layers: int = 30
     
-engram_cfg = EngramConfig()
-backbone_config = BackBoneConfig()
+@dataclass
+class DemoConfig:
+    text: str = "Only Alexander the Great could tame the horse Bucephalus."
+    tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
+    use_tiny_config: bool = True
+    token_preview: int = 12
+    seed: int = 0
+
+
+def print_section(title: str) -> None:
+    bar = "=" * len(title)
+    print(f"\n{title}\n{bar}")
+
+
+def describe_tensor(name: str, tensor: torch.Tensor) -> None:
+    print(f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype}")
+
+
+def preview_tokens(tokenizer: AutoTokenizer, input_ids: torch.Tensor, limit: int) -> None:
+    ids = input_ids[0].tolist()
+    tokens = tokenizer.convert_ids_to_tokens(ids)
+    preview = list(zip(ids[:limit], tokens[:limit]))
+    print(f"Token preview (id, token)[:{limit}]: {preview}")
+
+
+def build_demo_configs(
+    tokenizer: AutoTokenizer,
+    demo_cfg: DemoConfig,
+) -> tuple[EngramConfig, BackBoneConfig]:
+    if demo_cfg.use_tiny_config:
+        engram_cfg = EngramConfig(
+            tokenizer_name_or_path=demo_cfg.tokenizer_name_or_path,
+            engram_vocab_size=[101, 103],
+            max_ngram_size=3,
+            n_embed_per_ngram=64,
+            n_head_per_ngram=2,
+            layer_ids=[1],
+            pad_id=2,
+            seed=demo_cfg.seed,
+            kernel_size=2,
+        )
+        backbone_cfg = BackBoneConfig(
+            hidden_size=64,
+            hc_mult=2,
+            vocab_size=len(tokenizer),
+            num_layers=4,
+        )
+        return engram_cfg, backbone_cfg
+
+    engram_cfg = EngramConfig(
+        tokenizer_name_or_path=demo_cfg.tokenizer_name_or_path,
+        seed=demo_cfg.seed,
+    )
+    backbone_cfg = BackBoneConfig(vocab_size=len(tokenizer))
+    return engram_cfg, backbone_cfg
 
 class CompressedTokenizer:
     def __init__(
@@ -110,7 +163,10 @@ class CompressedTokenizer:
         return lookup, len(new_tokens)
     
     def _compress(self, input_ids):
-        arr = np.asarray(input_ids, dtype=np.int64)
+        if isinstance(input_ids, torch.Tensor):
+            arr = input_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+        else:
+            arr = np.asarray(input_ids, dtype=np.int64)
         pos_mask = arr >= 0
         out = arr.copy()
         valid_ids = arr[pos_mask]
@@ -264,6 +320,15 @@ class NgramHashMapping:
         input_ids: np.ndarray,
         layer_id: int,
     ) -> np.ndarray:
+        """
+        Build hash buckets for n-grams.
+
+        Output shape: (B, T, num_heads_across_all_ngrams)
+        Example when max_ngram_size=3, n_head_per_ngram=2:
+            2-gram -> 2 heads
+            3-gram -> 2 heads
+            total heads = 4
+        """
         x = np.asarray(input_ids, dtype=np.int64)
         B, T = x.shape
 
@@ -324,36 +389,38 @@ class MultiHeadEmbedding(nn.Module):
         return output
     
 class Engram(nn.Module):
-    def __init__(self, layer_id):
+    def __init__(self, layer_id, engram_cfg: EngramConfig, backbone_cfg: BackBoneConfig):
         super().__init__()
         self.layer_id = layer_id
+        self.engram_cfg = engram_cfg
+        self.backbone_cfg = backbone_cfg
         self.hash_mapping = NgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
-            max_ngram_size = engram_cfg.max_ngram_size,
-            n_embed_per_ngram = engram_cfg.n_embed_per_ngram,
-            n_head_per_ngram = engram_cfg.n_head_per_ngram,
-            layer_ids = engram_cfg.layer_ids,
+            max_ngram_size=engram_cfg.max_ngram_size,
+            n_embed_per_ngram=engram_cfg.n_embed_per_ngram,
+            n_head_per_ngram=engram_cfg.n_head_per_ngram,
+            layer_ids=engram_cfg.layer_ids,
             tokenizer_name_or_path=engram_cfg.tokenizer_name_or_path,
-            pad_id = engram_cfg.pad_id,
-            seed = engram_cfg.seed,
+            pad_id=engram_cfg.pad_id,
+            seed=engram_cfg.seed,
         )
         self.multi_head_embedding = MultiHeadEmbedding(
             list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
             D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
         )
         self.short_conv = ShortConv(
-            hidden_size = backbone_config.hidden_size,
-            kernel_size = engram_cfg.kernel_size,
-            dilation    = engram_cfg.max_ngram_size,
-            hc_mult     = backbone_config.hc_mult,
+            hidden_size=backbone_cfg.hidden_size,
+            kernel_size=engram_cfg.kernel_size,
+            dilation=engram_cfg.max_ngram_size,
+            hc_mult=backbone_cfg.hc_mult,
         )
-        engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
-        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size)
+        engram_hidden_size = (engram_cfg.max_ngram_size - 1) * engram_cfg.n_embed_per_ngram
+        self.value_proj = nn.Linear(engram_hidden_size, backbone_cfg.hidden_size)
         self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
+            [nn.Linear(engram_hidden_size, backbone_cfg.hidden_size) for _ in range(backbone_cfg.hc_mult)]
         )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_cfg.hidden_size) for _ in range(backbone_cfg.hc_mult)])
+        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_cfg.hidden_size) for _ in range(backbone_cfg.hc_mult)])
     
     def forward(self,hidden_states,input_ids):
         """
@@ -363,12 +430,12 @@ class Engram(nn.Module):
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         gates = []
-        for hc_idx in range(backbone_config.hc_mult):
+        for hc_idx in range(self.backbone_cfg.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
             normed_key = self.norm1[hc_idx](key)
             query = hidden_states[:,:,hc_idx,:]
             normed_query = self.norm2[hc_idx](query)
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
+            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(self.backbone_cfg.hidden_size)
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gate = gate.sigmoid().unsqueeze(-1)
             gates.append(gate)
@@ -378,13 +445,17 @@ class Engram(nn.Module):
         return output 
 
 class TransformerBlock(nn.Module):
-    def __init__(self,layer_id):
+    def __init__(self, layer_id, engram_cfg: EngramConfig, backbone_cfg: BackBoneConfig):
         super().__init__()
         self.attn = lambda x:x
         self.moe  = lambda x:x
         self.engram = None
         if layer_id in engram_cfg.layer_ids:
-            self.engram = Engram(layer_id=layer_id)
+            self.engram = Engram(
+                layer_id=layer_id,
+                engram_cfg=engram_cfg,
+                backbone_cfg=backbone_cfg,
+            )
     
     def forward(self,input_ids,hidden_states):
         if self.engram is not None:
@@ -394,30 +465,69 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 if __name__ == '__main__':
+    demo_cfg = DemoConfig()
+    torch.manual_seed(demo_cfg.seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        demo_cfg.tokenizer_name_or_path,
+        trust_remote_code=True,
+    )
+    engram_cfg, backbone_cfg = build_demo_configs(tokenizer, demo_cfg)
+
+    print_section("1) Tokenization")
+    input_ids = tokenizer(demo_cfg.text, return_tensors="pt").input_ids
+    describe_tensor("input_ids", input_ids)
+    preview_tokens(tokenizer, input_ids, demo_cfg.token_preview)
+
+    print_section("2) Compressed token ids")
+    compressed_tokenizer = CompressedTokenizer(demo_cfg.tokenizer_name_or_path)
+    compressed_ids = compressed_tokenizer(input_ids)
+    print(f"Compressed vocab size: {len(compressed_tokenizer)}")
+    print(f"Compressed ids preview: {compressed_ids[0][:demo_cfg.token_preview].tolist()}")
+
+    print_section("3) N-gram hash buckets")
+    hash_mapping = NgramHashMapping(
+        engram_vocab_size=engram_cfg.engram_vocab_size,
+        max_ngram_size=engram_cfg.max_ngram_size,
+        n_embed_per_ngram=engram_cfg.n_embed_per_ngram,
+        n_head_per_ngram=engram_cfg.n_head_per_ngram,
+        layer_ids=engram_cfg.layer_ids,
+        tokenizer_name_or_path=engram_cfg.tokenizer_name_or_path,
+        pad_id=engram_cfg.pad_id,
+        seed=engram_cfg.seed,
+    )
+    hash_ids = hash_mapping.hash(input_ids)[engram_cfg.layer_ids[0]]
+    print(f"Hash ids shape: {hash_ids.shape} (B, T, total_heads)")
+
+    print_section("4) Engram module forward")
     LLM = [
-        nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size),
-        *[TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)],
-        nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
+        nn.Embedding(backbone_cfg.vocab_size, backbone_cfg.hidden_size),
+        *[
+            TransformerBlock(
+                layer_id=layer_id,
+                engram_cfg=engram_cfg,
+                backbone_cfg=backbone_cfg,
+            )
+            for layer_id in range(backbone_cfg.num_layers)
+        ],
+        nn.Linear(backbone_cfg.hidden_size, backbone_cfg.vocab_size),
     ]
-
-    text = "Only Alexander the Great could tame the horse Bucephalus."
-    tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
-    input_ids = tokenizer(text,return_tensors='pt').input_ids
-
-    B,L = input_ids.shape
 
     for idx, layer in enumerate(LLM):
         if idx == 0:
             hidden_states = LLM[0](input_ids)
-            ## mock hyper-connection
-            hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
-        elif idx == len(LLM)-1:
-            ## mock hyper-connection
-            hidden_states = hidden_states[:,:,0,:] 
+            describe_tensor("embedding output", hidden_states)
+            # mock hyper-connection (expand to HC_MULT groups)
+            hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_cfg.hc_mult, -1)
+            describe_tensor("hyper-connection states", hidden_states)
+        elif idx == len(LLM) - 1:
+            # mock hyper-connection (collapse groups)
+            hidden_states = hidden_states[:, :, 0, :]
             output = layer(hidden_states)
+            describe_tensor("final logits", output)
         else:
-            hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+            hidden_states = layer(input_ids=input_ids, hidden_states=hidden_states)
 
+    print_section("5) Done")
     print("✅ Forward Complete!")
-    print(f"{input_ids.shape=}\n{output.shape=}")
             
